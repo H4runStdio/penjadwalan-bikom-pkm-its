@@ -451,10 +451,13 @@ def _sheet_jadwal_hari(wb: Workbook, hari: str, daftar: list, maks_per_sesi: int
 
 
 def _sheet_tim_belum_terplot(wb: Workbook, df_tim: pd.DataFrame, terplot_nrp_bidang: set):
-    """Sheet daftar tim yang tidak berhasil dijadwalkan + rekap per bidang."""
+    """
+    Sheet daftar tim yang tidak berhasil dijadwalkan.
+    Tabel utama di kolom A-D, rekap per bidang di kolom F-G (sejajar, mulai baris 1).
+    """
     ws = wb.create_sheet("Tim Belum Terplot")
 
-    # ── Tabel daftar tim ──
+    # ── Tabel utama (A-D) ──
     headers = ["No", "NRP", "Nama Ketua", "Bidang PKM"]
     for i, h in enumerate(headers, 1):
         _cell(ws, 1, i, value=h, fill=FILL_HEADER, font=FONT_BOLD)
@@ -473,31 +476,30 @@ def _sheet_tim_belum_terplot(wb: Workbook, df_tim: pd.DataFrame, terplot_nrp_bid
             row_idx += 1
             nomor   += 1
 
-    # Baris kosong pemisah
-    row_rekap = row_idx + 1
-
-    # ── Rekap jumlah per bidang ──
-    # Header "Rekap" di-merge 2 kolom
-    _merge(ws, row_rekap, 1, row_rekap, 2,
+    # ── Rekap per bidang (F-G), mulai baris 1, sejajar tabel utama ──
+    # Kolom F=6, G=7. Baris 1: header "Rekap" di-merge F1:G1
+    _merge(ws, 1, 6, 1, 7,
            value="Rekap", fill=FILL_HEADER, font=FONT_BOLD)
 
-    row_rekap += 1
-    _cell(ws, row_rekap, 1, value="Bidang PKM",              fill=FILL_HEADER, font=FONT_BOLD)
-    _cell(ws, row_rekap, 2, value="Jumlah Tim Belum Terplot", fill=FILL_HEADER, font=FONT_BOLD)
+    _cell(ws, 2, 6, value="Bidang PKM",               fill=FILL_HEADER, font=FONT_BOLD)
+    _cell(ws, 2, 7, value="Jumlah Tim Belum Terplot",  fill=FILL_HEADER, font=FONT_BOLD)
 
-    row_rekap += 1
     from collections import Counter
     rekap_bidang = Counter(belum_terplot_rows)
+    r_row = 3
     for bidang, jumlah in sorted(rekap_bidang.items()):
-        _cell(ws, row_rekap, 1, value=bidang, align=_LEFT)
-        _cell(ws, row_rekap, 2, value=jumlah)
-        row_rekap += 1
+        _cell(ws, r_row, 6, value=bidang,  align=_LEFT)
+        _cell(ws, r_row, 7, value=jumlah)
+        r_row += 1
 
-    # Total
-    _cell(ws, row_rekap, 1, value="Total", fill=FILL_HEADER, font=FONT_BOLD)
-    _cell(ws, row_rekap, 2, value=sum(rekap_bidang.values()), fill=FILL_HEADER, font=FONT_BOLD)
+    # Baris total
+    _cell(ws, r_row, 6, value="Total", fill=FILL_HEADER, font=FONT_BOLD)
+    _cell(ws, r_row, 7, value=sum(rekap_bidang.values()), fill=FILL_HEADER, font=FONT_BOLD)
 
+    # Lebar kolom
     _auto_col_width(ws)
+    # Kolom E (pemisah) dikosongkan/sempit
+    ws.column_dimensions["E"].width = 3
 
 
 def _sheet_dosen_belum_terplot(wb: Workbook, slot_dosen: dict):
