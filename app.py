@@ -16,16 +16,16 @@ KOLOM_WAJIB_DOSEN = ["nama lengkap", "bidang pkm"]
 
 CONTOH_TIM = pd.DataFrame(
     {
-        "NRP":        ["5099221001", "2099221002"],
-        "Nama Ketua": ["Mahasiswa A", "Mahasiswa B"],
-        "Bidang PKM": ["PKM-RE", "PKM-KI"],
+        "NRP":        ["5026221001", "5026221002"],
+        "Nama Ketua": ["Budi Santoso", "Ani Rahayu"],
+        "Bidang PKM": ["PKM-RE", "PKM-KC"],
     }
 )
 
 CONTOH_DOSEN = pd.DataFrame(
     {
-        "Nama Lengkap": ["Dosen A", "Dosen B"],
-        "Bidang PKM":   ["PKM-RE, PKM-KC", "PKM-KI"],
+        "Nama Lengkap": ["Dr. Andi", "Dr. Budi"],
+        "Bidang PKM":   ["PKM-RE, PKM-KC", "PKM-T"],
         "Lokasi":       ["Ruang A101", "Ruang B202"],
         "Senin":        ["08.00 - 10.00, 13.00 - 15.00", "09.00 - 11.00"],
         "Selasa":       ["Tidak Bersedia", "08.00 - 10.00"],
@@ -76,6 +76,10 @@ def validasi_isi_tim(df: pd.DataFrame) -> list[str]:
 
 
 def resolve_kolom_hari(df_columns: list, kolom_hari: dict) -> dict:
+    """
+    Cocokkan nama hari ke kolom aktual di DataFrame (partial match, case-insensitive).
+    Dipanggil SATU KALI di luar loop, bukan per-baris.
+    """
     cols_lower = {c.lower(): c for c in df_columns}
     resolved   = {}
     for nama_hari, kol_input in kolom_hari.items():
@@ -115,7 +119,7 @@ def validasi_isi_dosen(df: pd.DataFrame, kolom_hari: dict) -> list[str]:
             if not pola_jam.match(val):
                 errors.append(
                     f"Format jam tidak valid untuk dosen **{row.get('nama lengkap', '?')}** "
-                    f"hari **{nama_hari}**: `{val}` — "
+                    f"hari **{nama_hari}**: `{val}` - "
                     "gunakan format `HH.MM - HH.MM` (pisah koma jika lebih dari satu sesi)."
                 )
     return errors
@@ -132,13 +136,18 @@ def cek_bidang_mismatch(df_tim: pd.DataFrame, df_dosen: pd.DataFrame) -> list[st
         if str(bidang).lower() not in semua_bidang_dosen:
             jumlah = (df_tim["bidang pkm"] == bidang).sum()
             warnings.append(
-                f"Bidang **{bidang}** ({jumlah} tim) tidak memiliki dosen pembimbing — "
+                f"Bidang **{bidang}** ({jumlah} tim) tidak memiliki dosen pembimbing yang sesuai, "
                 "tim ini dipastikan tidak terplot."
             )
     return warnings
 
 
 def deduplikasi_tim(df_tim: pd.DataFrame) -> tuple[pd.DataFrame, int]:
+    """
+    Hapus baris dengan NRP + Bidang PKM yang PERSIS sama (duplikasi sejati).
+    NRP sama tapi Bidang PKM berbeda tetap dipertahankan (diplot keduanya).
+    Kembalikan (df_bersih, jumlah_dihapus).
+    """
     sebelum = len(df_tim)
     df_clean = df_tim.drop_duplicates(subset=["nrp", "bidang pkm"], keep="first").reset_index(drop=True)
     return df_clean, sebelum - len(df_clean)
@@ -182,9 +191,11 @@ def jam_mulai_dt(sesi_range: str) -> datetime:
 
 
 def hitung_sisa_jam(sesi_range: str, slot_terpakai: int, semua_slots: list[str]) -> str | None:
+    """Kembalikan string sisa jam, atau None jika semua sudah terpakai."""
     total = len(semua_slots)
     if slot_terpakai >= total:
         return None
+    # Sisa: dari jam akhir slot terakhir yang terpakai sampai akhir sesi
     _, selesai_range = sesi_range.split(" - ", 1)
     if slot_terpakai == 0:
         mulai_range = sesi_range.split(" - ")[0].strip()
@@ -295,7 +306,7 @@ def run_scheduling(
                             "Sesi":   sesi["range"],
                             "Jam":    jam,
                             "Ketua":  tim["nama ketua"],
-                            "NRP":    tim["nrp"],
+                            "NRP":    str(tim["nrp"]),
                             "Bidang": tim["bidang pkm"],
                             "Lokasi": data["lokasi"],
                         }
@@ -324,22 +335,38 @@ _LEFT    = Alignment(horizontal="left",   vertical="center", wrap_text=True)
 
 
 def _cell(ws, r: int, c: int, value=None, fill=None, font=None, align=None):
+    """Tulis nilai + style ke satu sel. Semua parameter opsional."""
     cell = ws.cell(row=r, column=c)
     if value is not None:
         cell.value = value
-    cell.border  = _make_border()
+    cell.border    = _make_border()
     cell.alignment = align or _CENTER
+    cell.font      = font if font is not None else FONT_NORMAL
     if fill:
         cell.fill = fill
-    if font:
-        cell.font = font
     return cell
 
 
 def _merge(ws, r1: int, c1: int, r2: int, c2: int,
            value=None, fill=None, font=None, align=None):
+    """
+    Merge cells dan terapkan border ke SEMUA sel dalam range,
+    bukan hanya sel kiri-atas — ini yang menyebabkan border tidak sempurna.
+    """
     ws.merge_cells(start_row=r1, start_column=c1, end_row=r2, end_column=c2)
-    _cell(ws, r1, c1, value=value, fill=fill, font=font, align=align)
+    b = _make_border()
+    f = font if font is not None else FONT_NORMAL
+    for row in range(r1, r2 + 1):
+        for col in range(c1, c2 + 1):
+            cell = ws.cell(row=row, column=col)
+            cell.border = b
+            if fill:
+                cell.fill = fill
+            cell.font = f
+    top_left = ws.cell(row=r1, column=c1)
+    if value is not None:
+        top_left.value = value
+    top_left.alignment = align or _CENTER
 
 
 def _auto_col_width(ws, max_width: int = 40):
@@ -365,14 +392,16 @@ FILL_LOKASI = _make_fill("FFF2CC")
 FILL_HEADER = _make_fill("D9D9D9")
 FILL_BELUM  = _make_fill("FCE5CD")
 
-FONT_WHITE_BOLD = Font(bold=True, color="FFFFFF")
-FONT_BOLD       = Font(bold=True)
+FONT_WHITE_BOLD = Font(name="Arial", bold=True, color="FFFFFF")
+FONT_BOLD       = Font(name="Arial", bold=True)
+FONT_NORMAL     = Font(name="Arial")
 
 
 def _sheet_jadwal_hari(wb: Workbook, hari: str, daftar: list, maks_per_sesi: int,
                        max_table_per_row: int):
-    TABLE_W = 6
-    HDR_H   = 4
+    """Buat satu sheet untuk satu hari bimbingan."""
+    TABLE_W = 5          # No | Jam | Nama Ketua | Bidang  (+1 kolom gap antar tabel)
+    HDR_H   = 4          # baris dosen + hari/sesi + lokasi + header kolom
     TABLE_H = HDR_H + maks_per_sesi
 
     ws = wb.create_sheet(hari)
@@ -384,21 +413,21 @@ def _sheet_jadwal_hari(wb: Workbook, hari: str, daftar: list, maks_per_sesi: int
         sc = 1 + (table_idx % max_table_per_row) * TABLE_W
         sr = 1 + (table_idx // max_table_per_row) * (TABLE_H + 2)
 
-        # Baris 1 – nama dosen
-        _merge(ws, sr, sc, sr, sc + 4,
+        # Baris 1 — nama dosen (span 4 kolom: No, Jam, Nama Ketua, Bidang)
+        _merge(ws, sr, sc, sr, sc + 3,
                value=dosen, fill=FILL_DOSEN, font=FONT_WHITE_BOLD)
 
-        # Baris 2 – hari + sesi
-        _merge(ws, sr + 1, sc, sr + 1, sc + 4,
-               value=f"{hari}, {sesi}", fill=FILL_HARI)
+        # Baris 2 — hari + sesi
+        _merge(ws, sr + 1, sc, sr + 1, sc + 3,
+               value=f"{hari}  |  {sesi}", fill=FILL_HARI)
 
-        # Baris 3 – lokasi
-        lokasi_val = items[0]["Lokasi"] if items else ""
-        _merge(ws, sr + 2, sc, sr + 2, sc + 4,
-               value=lokasi_val if lokasi_val else "—", fill=FILL_LOKASI)
+        # Baris 3 — lokasi (kosong jika tidak ada, tanpa em dash)
+        lokasi_val = (items[0]["Lokasi"] if items else "") or ""
+        _merge(ws, sr + 2, sc, sr + 2, sc + 3,
+               value=lokasi_val, fill=FILL_LOKASI)
 
-        # Baris 4 – header kolom
-        for i, h in enumerate(["No", "NRP", "Jam", "Nama Ketua", "Bidang"]):
+        # Baris 4 — header kolom (4 kolom, tanpa NRP)
+        for i, h in enumerate(["No", "Jam", "Nama Ketua", "Bidang"]):
             _cell(ws, sr + 3, sc + i, value=h, fill=FILL_HEADER, font=FONT_BOLD)
 
         # Baris data
@@ -406,18 +435,18 @@ def _sheet_jadwal_hari(wb: Workbook, hari: str, daftar: list, maks_per_sesi: int
             r = sr + 4 + i
             _cell(ws, r, sc, value=i + 1)
             if i < len(items):
-                _cell(ws, r, sc + 1, value=items[i]["NRP"],    align=_LEFT)
-                _cell(ws, r, sc + 2, value=items[i]["Jam"])
-                _cell(ws, r, sc + 3, value=items[i]["Ketua"],  align=_LEFT)
-                _cell(ws, r, sc + 4, value=items[i]["Bidang"])
+                _cell(ws, r, sc + 1, value=items[i]["Jam"])
+                _cell(ws, r, sc + 2, value=items[i]["Ketua"], align=_LEFT)
+                _cell(ws, r, sc + 3, value=items[i]["Bidang"])
             else:
-                for c in range(sc + 1, sc + 5):
+                for c in range(sc + 1, sc + 4):
                     _cell(ws, r, c)
 
     _auto_col_width(ws)
 
 
 def _sheet_tim_belum_terplot(wb: Workbook, df_tim: pd.DataFrame, terplot_nrp_bidang: set):
+    """Sheet daftar tim yang tidak berhasil dijadwalkan."""
     ws = wb.create_sheet("Tim Belum Terplot")
     headers = ["No", "NRP", "Nama Ketua", "Bidang PKM"]
     for i, h in enumerate(headers, 1):
@@ -439,6 +468,7 @@ def _sheet_tim_belum_terplot(wb: Workbook, df_tim: pd.DataFrame, terplot_nrp_bid
 
 
 def _sheet_dosen_belum_terplot(wb: Workbook, slot_dosen: dict):
+    """Sheet sisa slot dosen yang belum terisi."""
     ws      = wb.create_sheet("Dosen Belum Terplot")
     headers = ["No", "Nama Dosen", "Hari", "Sesi Jam", "Sisa Jam Kosong", "Lokasi"]
     for i, h in enumerate(headers, 1):
@@ -452,7 +482,7 @@ def _sheet_dosen_belum_terplot(wb: Workbook, slot_dosen: dict):
                 sisa_str = hitung_sisa_jam(sesi["range"], sesi["slot_index"], sesi["slots"])
                 if sisa_str:
                     vals = [no, nama_dosen, nama_hari, sesi["range"],
-                            sisa_str, data["lokasi"] or "—"]
+                            sisa_str, data["lokasi"] or ""]
                     for i, v in enumerate(vals, 1):
                         _cell(ws, row, i, value=v, align=_LEFT)
                     row += 1
@@ -462,6 +492,7 @@ def _sheet_dosen_belum_terplot(wb: Workbook, slot_dosen: dict):
 
 
 def _sheet_rekap(wb: Workbook, df_hasil: pd.DataFrame):
+    """Sheet rekap statistik hasil penjadwalan."""
     ws = wb.create_sheet("Rekap")
     if df_hasil.empty:
         ws.cell(1, 1, "Tidak ada data hasil penjadwalan.")
@@ -564,21 +595,21 @@ def export_excel(
 #  KOMPONEN UI
 # ─────────────────────────────────────────────
 def render_panduan():
-    with st.expander("📋 Panduan Format File Excel", expanded=False):
+    with st.expander("Panduan Format File Excel", expanded=False):
         st.markdown(
             """
 Unggah dua file Excel dengan format di bawah ini.
 Nama kolom **tidak case-sensitive** (huruf besar/kecil tidak berpengaruh).
             """
         )
-        tab1, tab2 = st.tabs(["📁 File Tim", "📁 File Dosen"])
+        tab1, tab2 = st.tabs(["File Tim", "File Dosen"])
 
         with tab1:
             st.markdown("**Kolom wajib:**")
             st.markdown(
-                "- `NRP`: Nomor Registrasi Pokok mahasiswa ketua tim  \n"
-                "- `Nama Ketua`: Nama lengkap ketua tim  \n"
-                "- `Bidang PKM`: Bidang PKM tim (harus sama persis dengan yang ada di file dosen)"
+                "- `NRP` : Nomor Registrasi Pokok mahasiswa ketua tim  \n"
+                "- `Nama Ketua` : Nama lengkap ketua tim  \n"
+                "- `Bidang PKM` : Bidang PKM tim (harus sama persis dengan yang ada di file dosen)"
             )
             st.markdown(
                 "**Catatan duplikasi NRP:**  \n"
@@ -592,10 +623,10 @@ Nama kolom **tidak case-sensitive** (huruf besar/kecil tidak berpengaruh).
         with tab2:
             st.markdown("**Kolom wajib:**")
             st.markdown(
-                "- `Nama Lengkap`: Nama dosen  \n"
-                "- `Bidang PKM`: Bidang yang bisa dibimbing, pisah koma jika lebih dari satu  \n"
-                "- `Lokasi`: Ruang/lokasi *(opsional, isi `—` jika belum ditentukan)*  \n"
-                "- **Kolom hari** Sesuai yang diisi di sidebar. "
+                "- `Nama Lengkap` : Nama dosen  \n"
+                "- `Bidang PKM` : Bidang yang bisa dibimbing, pisah koma jika lebih dari satu  \n"
+                "- `Lokasi` : Ruang/lokasi *(opsional, kosongkan jika belum ditentukan)*  \n"
+                "- **Kolom hari** : Sesuai yang diisi di sidebar. "
                 "Cukup tuliskan sebagian nama kolom, misalnya `Senin` sudah cukup untuk "
                 "mencocokkan `Jam Kesediaan pada Senin, 12 Januari 2026`."
             )
@@ -609,7 +640,7 @@ Nama kolom **tidak case-sensitive** (huruf besar/kecil tidak berpengaruh).
 
 
 def render_preview_kapasitas(df_tim: pd.DataFrame, slot_dosen: dict, maks_per_sesi: int):
-    with st.expander("🔍 Preview Kapasitas Sebelum Proses", expanded=True):
+    with st.expander("Preview Kapasitas Sebelum Proses", expanded=True):
         total_tim = len(df_tim)
         total_kapasitas = sum(
             min(maks_per_sesi, len(s["slots"]))
@@ -631,11 +662,11 @@ def render_preview_kapasitas(df_tim: pd.DataFrame, slot_dosen: dict, maks_per_se
 
         if delta < 0:
             st.warning(
-                f"⚠️ Kapasitas dosen ({total_kapasitas}) lebih sedikit dari jumlah tim ({total_tim}). "
+                f"Kapasitas dosen ({total_kapasitas}) lebih sedikit dari jumlah tim ({total_tim}). "
                 f"Diprediksi **{abs(delta)} tim tidak akan terplot**."
             )
         else:
-            st.success(f"✅ Kapasitas cukup. Ada {delta} slot tersisa setelah semua tim terplot.")
+            st.success(f"Kapasitas cukup. Ada {delta} slot tersisa setelah semua tim terplot.")
 
         st.markdown("**Kapasitas per Bidang PKM:**")
         bidang_tim = df_tim["bidang pkm"].value_counts().reset_index()
@@ -654,7 +685,7 @@ def render_preview_kapasitas(df_tim: pd.DataFrame, slot_dosen: dict, maks_per_se
             lambda b: kapasitas_bidang.get(b, 0)
         )
         bidang_tim["Status"] = bidang_tim.apply(
-            lambda r: "✅ Cukup" if r["Kapasitas Dosen"] >= r["Jumlah Tim"] else "⚠️ Kurang",
+            lambda r: "Cukup" if r["Kapasitas Dosen"] >= r["Jumlah Tim"] else "Kurang",
             axis=1,
         )
         st.dataframe(bidang_tim, hide_index=True, use_container_width=True)
@@ -666,14 +697,14 @@ def render_preview_kapasitas(df_tim: pd.DataFrame, slot_dosen: dict, maks_per_se
 def main():
     st.set_page_config(
         page_title="Penjadwalan Bimbingan Komunal",
-        page_icon="📅",
+        page_icon=":calendar:",
         layout="wide",
     )
-    st.title("📅 Sistem Penjadwalan Bimbingan Komunal")
+    st.title("Sistem Penjadwalan Bimbingan Komunal")
     st.caption("Penjadwalan otomatis berbasis ketersediaan dosen dan bidang PKM.")
 
     # ── Sidebar ──
-    st.sidebar.header("⚙️ Parameter Penjadwalan")
+    st.sidebar.header("Parameter Penjadwalan")
 
     DURASI          = st.sidebar.number_input("Durasi per Tim (menit)",             10, 120, 20)
     MAKS_PER_SESI   = st.sidebar.number_input("Maks Tim per Dosen per Sesi",          1,  30, 12)
@@ -682,11 +713,11 @@ def main():
     RANDOM_SEED     = st.sidebar.number_input(
         "Random Seed",
         min_value=0, max_value=9999, value=42,
-        help="Angka yang sama → urutan dosen yang sama. Ubah jika ingin variasi.",
+        help="Angka yang sama menghasilkan urutan dosen yang sama. Ubah jika ingin variasi.",
     )
 
     st.sidebar.markdown("---")
-    st.sidebar.markdown("### 🗓️ Hari Bimbingan")
+    st.sidebar.markdown("### Hari Bimbingan")
 
     JUMLAH_HARI = st.sidebar.number_input("Jumlah Hari", 1, 14, 5)
     HARI_BIMBINGAN: dict[str, str] = {}
@@ -703,7 +734,7 @@ def main():
     st.divider()
 
     # ── Upload ──
-    st.subheader("📂 Upload File Data")
+    st.subheader("Upload File Data")
     col_up1, col_up2 = st.columns(2)
     with col_up1:
         file_tim   = st.file_uploader("File Data Tim (.xlsx)",   type=["xlsx"])
@@ -731,7 +762,7 @@ def main():
     errors += validasi_kolom(df_dosen, KOLOM_WAJIB_DOSEN, "Dosen")
 
     if errors:
-        st.error("**Struktur file tidak sesuai. Perbaiki terlebih dahulu:**")
+        st.error("Struktur file tidak sesuai. Perbaiki terlebih dahulu:")
         for e in errors:
             st.markdown(f"- {e}")
         return
@@ -740,7 +771,7 @@ def main():
     df_tim, n_dup = deduplikasi_tim(df_tim)
     if n_dup > 0:
         st.info(
-            f"ℹ️ Ditemukan **{n_dup} baris duplikat** (NRP + Bidang PKM sama persis) dan telah dihapus. "
+            f"Ditemukan **{n_dup} baris duplikat** (NRP + Bidang PKM sama persis) dan telah dihapus. "
             "Tim dengan NRP sama tapi Bidang PKM berbeda tetap dijadwalkan masing-masing."
         )
 
@@ -758,7 +789,7 @@ def main():
     warnings_isi += cek_bidang_mismatch(df_tim, df_dosen)
 
     if warnings_isi:
-        with st.expander("⚠️ Peringatan Data (klik untuk lihat)", expanded=True):
+        with st.expander("Peringatan Data (klik untuk lihat)", expanded=True):
             for w in warnings_isi:
                 st.warning(w)
             st.markdown(
@@ -766,7 +797,7 @@ def main():
             )
 
     # ── Preview data ──
-    st.subheader("👁️ Preview Data")
+    st.subheader("Preview Data")
     with st.expander("Lihat data yang terbaca", expanded=False):
         t1, t2 = st.tabs(["Data Tim", "Data Dosen"])
         with t1:
@@ -781,7 +812,7 @@ def main():
     st.divider()
 
     # ── Proses ──
-    if st.button("🚀 Proses Penjadwalan", type="primary", use_container_width=True):
+    if st.button("Proses Penjadwalan", type="primary", use_container_width=True):
         with st.spinner("Memproses penjadwalan..."):
             slot_dosen_fresh = build_slot_dosen(df_dosen, kolom_hari_lower, DURASI)
             hasil = run_scheduling(df_tim, slot_dosen_fresh, MAKS_PER_SESI, RANDOM_SEED)
@@ -793,7 +824,7 @@ def main():
         df_hasil = pd.DataFrame(hasil)
 
         # ── Ringkasan ──
-        st.subheader("📊 Ringkasan Hasil")
+        st.subheader("Ringkasan Hasil")
         total_tim     = len(df_tim)
         total_terplot = len(df_hasil)
         total_tidak   = total_tim - total_terplot
@@ -822,7 +853,7 @@ def main():
                 hasil, slot_dosen_fresh, df_tim, MAKS_PER_SESI, MAX_TABLE_ROW
             )
             st.download_button(
-                label="⬇️ Download Jadwal Excel",
+                label="Download Jadwal Excel",
                 data=excel_bytes,
                 file_name=OUTPUT_FILE,
                 mime="application/vnd.openxmlformats-officedocument.spreadsheetml.sheet",
@@ -830,7 +861,7 @@ def main():
                 use_container_width=True,
             )
             st.success(
-                f"✅ Penjadwalan selesai. **{total_terplot}** dari **{total_tim}** tim berhasil dijadwalkan."
+                f"Penjadwalan selesai. **{total_terplot}** dari **{total_tim}** tim berhasil dijadwalkan."
             )
         except Exception as e:
             st.error(f"Gagal membuat file Excel: {e}")
