@@ -1,300 +1,841 @@
-import streamlit as st
-import pandas as pd
-from datetime import datetime, timedelta
-from openpyxl import Workbook
-from openpyxl.styles import PatternFill, Alignment, Border, Side
 import io
+import random
+import re
+from datetime import datetime, timedelta
 
-st.set_page_config(page_title="Penjadwalan Bimbingan Otomatis", layout="wide")
-st.title("📅 Sistem Penjadwalan Bimbingan Komunal")
+import pandas as pd
+import streamlit as st
+from openpyxl import Workbook
+from openpyxl.styles import Alignment, Border, Font, PatternFill, Side
 
-# PARAMETER
-st.sidebar.header("⚙️ Parameter Penjadwalan")
+# ─────────────────────────────────────────────
+#  KONSTANTA
+# ─────────────────────────────────────────────
+KOLOM_WAJIB_TIM   = ["nrp", "nama ketua", "bidang pkm"]
+KOLOM_WAJIB_DOSEN = ["nama lengkap", "bidang pkm"]
 
-DURASI_PER_TIM = st.sidebar.number_input("Durasi per Tim (menit)", 10, 120, 20)
-MAKS_TIM_PER_DOSEN_PER_SESI = st.sidebar.number_input("Maks Tim per Dosen per Sesi", 1, 30, 12)
-MAX_TABLE_PER_ROW = st.sidebar.number_input("Jumlah Tabel per Baris", 1, 10, 6)
-
-OUTPUT_FILE = st.sidebar.text_input(
-    "Nama File Excel Output",
-    value="jadwal_bikom.xlsx"
+CONTOH_TIM = pd.DataFrame(
+    {
+        "NRP":        ["5099221001", "2099221002"],
+        "Nama Ketua": ["Mahasiswa A", "Mahasiswa B"],
+        "Bidang PKM": ["PKM-RE", "PKM-KI"],
+    }
 )
 
-JUMLAH_HARI = st.sidebar.number_input(
-    "Jumlah Hari Bimbingan",
-    min_value=1,
-    max_value=14,
-    value=2,
-    step=1
+CONTOH_DOSEN = pd.DataFrame(
+    {
+        "Nama Lengkap": ["Dosen A", "Dosen B"],
+        "Bidang PKM":   ["PKM-RE, PKM-KC", "PKM-KI"],
+        "Lokasi":       ["Ruang A101", "Ruang B202"],
+        "Senin":        ["08.00 - 10.00, 13.00 - 15.00", "09.00 - 11.00"],
+        "Selasa":       ["Tidak Bersedia", "08.00 - 10.00"],
+    }
 )
 
-st.sidebar.markdown("### 🗓️ Kolom Hari Bimbingan")
 
-HARI_BIMBINGAN = {}
+# ─────────────────────────────────────────────
+#  CLEANING & VALIDASI
+# ─────────────────────────────────────────────
+def normalize_columns(df: pd.DataFrame) -> pd.DataFrame:
+    df.columns = [c.strip().lower() for c in df.columns]
+    return df
 
-for i in range(JUMLAH_HARI):
-    col1, col2 = st.sidebar.columns(2)
 
-    with col1:
-        nama_hari = st.text_input(
-            f"Nama Hari ke-{i+1}",
-            key=f"hari_{i}"
+def clean_dataframe(df: pd.DataFrame) -> pd.DataFrame:
+    df = df.dropna(how="all").reset_index(drop=True)
+    for col in df.select_dtypes(include="object").columns:
+        df[col] = (
+            df[col]
+            .astype(str)
+            .str.strip()
+            .str.replace("–", "-", regex=False)
+            .str.replace("—", "-", regex=False)
+            .str.replace("−", "-", regex=False)
+            .str.replace(r"\s+", " ", regex=True)
+        )
+    return df
+
+
+def validasi_kolom(df: pd.DataFrame, kolom_wajib: list[str], label: str) -> list[str]:
+    ada    = set(df.columns.str.strip().str.lower())
+    kurang = [k for k in kolom_wajib if k not in ada]
+    if kurang:
+        return [
+            f"File **{label}** kekurangan kolom: "
+            + ", ".join(f"`{k.title()}`" for k in kurang)
+        ]
+    return []
+
+
+def validasi_isi_tim(df: pd.DataFrame) -> list[str]:
+    errors = []
+    for col, label in [("nrp", "NRP"), ("nama ketua", "Nama Ketua"), ("bidang pkm", "Bidang PKM")]:
+        if df[col].isnull().any() or (df[col] == "nan").any():
+            errors.append(f"Ada baris di file tim dengan **{label} kosong**.")
+    return errors
+
+
+def resolve_kolom_hari(df_columns: list, kolom_hari: dict) -> dict:
+    cols_lower = {c.lower(): c for c in df_columns}
+    resolved   = {}
+    for nama_hari, kol_input in kolom_hari.items():
+        kol_lower = kol_input.lower()
+        if kol_lower in cols_lower:
+            resolved[nama_hari] = cols_lower[kol_lower]
+        else:
+            matches = [c_orig for c_low, c_orig in cols_lower.items() if kol_lower in c_low]
+            resolved[nama_hari] = matches[0] if matches else None
+    return resolved
+
+
+def _is_kosong(val: str) -> bool:
+    return val.strip().lower() in ("", "nan", "none", "tidak bersedia", "-", "n/a", "na")
+
+
+def validasi_isi_dosen(df: pd.DataFrame, kolom_hari: dict) -> list[str]:
+    errors   = []
+    resolved = resolve_kolom_hari(list(df.columns), kolom_hari)
+
+    tidak_ketemu = [h for h, kol in resolved.items() if kol is None]
+    if tidak_ketemu:
+        errors.append(
+            "File dosen tidak memiliki kolom untuk hari: "
+            + ", ".join(f"**{h}**" for h in tidak_ketemu)
+            + ". Pastikan nama kolom di sidebar sesuai."
         )
 
-    with col2:
-        nama_kolom = st.text_input(
-            f"Nama Kolom Excel Hari ke-{i+1}",
-            key=f"kolom_{i}"
-        )
-
-    if nama_hari and nama_kolom:
-        HARI_BIMBINGAN[nama_hari] = nama_kolom
-
-# UPLOAD
-file_tim = st.file_uploader("Upload File Excel Data Tim", type=["xlsx"])
-file_dosen = st.file_uploader("Upload File Excel Data Dosen", type=["xlsx"])
-
-if file_tim and file_dosen:
-    df_tim = pd.read_excel(file_tim)
-    df_dosen = pd.read_excel(file_dosen)
-
-    st.success("File berhasil dibaca")
-
-    # FUNGSI JAM
-    def buat_slot(jam_mulai, jam_selesai, durasi):
-        slot = []
-        start = datetime.strptime(jam_mulai, "%H.%M")
-        end = datetime.strptime(jam_selesai, "%H.%M")
-        while start + timedelta(minutes=durasi) <= end:
-            slot.append(f"{start.strftime('%H:%M')}-{(start + timedelta(minutes=durasi)).strftime('%H:%M')}")
-            start += timedelta(minutes=durasi)
-        return slot
-
-    def parse_jam_per_sesi(jam_text):
-        if pd.isna(jam_text) or str(jam_text).strip() == "Tidak Bersedia":
-            return []
-        sesi_list = []
-        for bagian in str(jam_text).split(","):
-            bagian = bagian.strip().replace("–", "-").replace("—", "-")
-            if " - " not in bagian:
+    pola_jam = re.compile(r"^\d{2}\.\d{2} - \d{2}\.\d{2}(, \d{2}\.\d{2} - \d{2}\.\d{2})*$")
+    for _, row in df.iterrows():
+        for nama_hari, kol_aktual in resolved.items():
+            if kol_aktual is None:
                 continue
-            mulai, selesai = bagian.split(" - ")
-            sesi_list.append({
-                "range": f"{mulai} - {selesai}",
-                "slots": buat_slot(mulai, selesai, DURASI_PER_TIM)
-            })
-        return sesi_list
-
-    def jam_mulai_sesi(sesi_range):
-        return datetime.strptime(sesi_range.split(" - ")[0], "%H.%M")
-
-    def hitung_sisa_jam(sesi_range, slot_terpakai):
-        mulai, selesai = sesi_range.split(" - ")
-        selesai_dt = datetime.strptime(selesai, "%H.%M")
-        if not slot_terpakai:
-            return sesi_range
-        last_end = slot_terpakai[-1].split("-")[1]
-        last_end_dt = datetime.strptime(last_end, "%H:%M")
-        if last_end_dt >= selesai_dt:
-            return None
-        return f"{last_end_dt.strftime('%H:%M')} - {selesai}"
-
-    if st.button("🚀 Proses Penjadwalan"):
-        
-        # PROSES DOSEN
-        slot_dosen = {}
-        for _, row in df_dosen.iterrows():
-            slot_dosen[row["Nama Lengkap"]] = {
-                "bidang": [b.strip() for b in row["Bidang PKM"].split(",")],
-                "lokasi": row["Lokasi"],
-                "jadwal": {}
-            }
-            
-            for hari, kol in HARI_BIMBINGAN.items():
-                if kol not in row:
-                    continue
-            
-                sesi = parse_jam_per_sesi(row[kol])
-                if sesi:
-                    slot_dosen[row["Nama Lengkap"]]["jadwal"][hari] = sesi
-
-        
-        # PENJADWALAN
-        hasil = []
-        jumlah_tim_dosen = {}
-
-        for _, tim in df_tim.iterrows():
-            assigned = False
-            for dosen, data in slot_dosen.items():
-                if assigned or tim["Bidang PKM"] not in data["bidang"]:
-                    continue
-                jumlah_tim_dosen.setdefault(dosen, {})
-                for hari, sesi_list in data["jadwal"].items():
-                    jumlah_tim_dosen[dosen].setdefault(hari, {})
-                    for sesi in sesi_list:
-                        sesi_range = sesi["range"]
-                        jumlah_tim_dosen[dosen][hari].setdefault(sesi_range, 0)
-                        if jumlah_tim_dosen[dosen][hari][sesi_range] >= MAKS_TIM_PER_DOSEN_PER_SESI:
-                            continue
-                        if sesi["slots"]:
-                            hasil.append({
-                                "Dosen": dosen,
-                                "Hari": hari,
-                                "Sesi": sesi_range,
-                                "Jam": sesi["slots"].pop(0),
-                                "Ketua": tim["Nama Ketua"],
-                                "NRP": tim["NRP"],
-                                "Bidang": tim["Bidang PKM"],
-                                "Lokasi": data["lokasi"]
-                            })
-                            jumlah_tim_dosen[dosen][hari][sesi_range] += 1
-                            assigned = True
-                            break
-                    if assigned:
-                        break
-
-        # OUTPUT EXCEL
-        # Jadwal
-        wb = Workbook()
-        del wb["Sheet"]
-
-        center = Alignment(horizontal="center", vertical="center")
-        border = Border(*(Side(style="thin"),) * 4)
-
-        fill_dosen = PatternFill("solid", fgColor="3d85c6")
-        fill_hari = PatternFill("solid", fgColor="9fc5e8")
-        fill_lokasi = PatternFill("solid", fgColor="fff2cc")
-
-        TABLE_WIDTH = 6
-        HEADER_HEIGHT = 4
-        MAX_BARIS = MAKS_TIM_PER_DOSEN_PER_SESI
-        TABLE_HEIGHT = HEADER_HEIGHT + MAX_BARIS
-
-        grouped = {}
-        for h in hasil:
-            grouped.setdefault(h["Hari"], {}).setdefault(h["Dosen"], {}).setdefault(h["Sesi"], []).append(h)
-
-        for hari in sorted(grouped):
-            ws = wb.create_sheet(hari)
-            table_idx = 0
-            daftar = [(s, d, i) for d, sd in grouped[hari].items() for s, i in sd.items()]
-            daftar.sort(key=lambda x: jam_mulai_sesi(x[0]))
-
-            for sesi, dosen, items in daftar:
-                sc = 1 + (table_idx % MAX_TABLE_PER_ROW) * TABLE_WIDTH
-                sr = 1 + (table_idx // MAX_TABLE_PER_ROW) * (TABLE_HEIGHT + 1)
-
-                ws.merge_cells(
-                    start_row=sr,
-                    start_column=sc,
-                    end_row=sr,
-                    end_column=sc+4
+            val = str(row.get(kol_aktual, "")).strip()
+            if _is_kosong(val):
+                continue
+            if not pola_jam.match(val):
+                errors.append(
+                    f"Format jam tidak valid untuk dosen **{row.get('nama lengkap', '?')}** "
+                    f"hari **{nama_hari}**: `{val}` — "
+                    "gunakan format `HH.MM - HH.MM` (pisah koma jika lebih dari satu sesi)."
                 )
-                ws.cell(sr, sc, dosen).fill = fill_dosen
-                ws.cell(sr, sc).alignment = center
+    return errors
 
-                ws.merge_cells(
-                    start_row=sr+1,
-                    start_column=sc,
-                    end_row=sr+1,
-                    end_column=sc+4
-                )
-                ws.cell(sr+1, sc, f"{hari}, {sesi}").fill = fill_hari
-                ws.cell(sr+1, sc).alignment = center
 
-                ws.merge_cells(
-                    start_row=sr+2,
-                    start_column=sc,
-                    end_row=sr+2,
-                    end_column=sc+4
-                )
-                ws.cell(sr+2, sc, items[0]["Lokasi"]).fill = fill_lokasi
-                ws.cell(sr+2, sc).alignment = center
+def cek_bidang_mismatch(df_tim: pd.DataFrame, df_dosen: pd.DataFrame) -> list[str]:
+    semua_bidang_dosen: set[str] = set()
+    for val in df_dosen["bidang pkm"]:
+        for b in str(val).split(","):
+            semua_bidang_dosen.add(b.strip().lower())
 
-                headers = ["No", "KSN", "Jam", "Nama Ketua", "Bidang"]
-                for i, h in enumerate(headers):
-                    ws.cell(sr+3, sc+i, h).alignment = center
+    warnings = []
+    for bidang in df_tim["bidang pkm"].unique():
+        if str(bidang).lower() not in semua_bidang_dosen:
+            jumlah = (df_tim["bidang pkm"] == bidang).sum()
+            warnings.append(
+                f"Bidang **{bidang}** ({jumlah} tim) tidak memiliki dosen pembimbing — "
+                "tim ini dipastikan tidak terplot."
+            )
+    return warnings
 
-                ws.merge_cells(
-                    start_row=sr+4,
-                    start_column=sc+1,
-                    end_row=sr+4+MAX_BARIS-1,
-                    end_column=sc+1
-                )
 
-                for i in range(MAX_BARIS):
-                    r = sr+4+i
-                    ws.cell(r, sc, i+1)
-                    if i < len(items):
-                        ws.cell(r, sc+2, items[i]["Jam"])
-                        ws.cell(r, sc+3, items[i]["Ketua"])
-                        ws.cell(r, sc+4, items[i]["Bidang"])
+def deduplikasi_tim(df_tim: pd.DataFrame) -> tuple[pd.DataFrame, int]:
+    sebelum = len(df_tim)
+    df_clean = df_tim.drop_duplicates(subset=["nrp", "bidang pkm"], keep="first").reset_index(drop=True)
+    return df_clean, sebelum - len(df_clean)
 
-                for r in range(sr, sr+4+MAX_BARIS):
-                    for c in range(sc, sc+5):
-                        ws.cell(r, c).border = border
 
-                table_idx += 1
+# ─────────────────────────────────────────────
+#  PARSING JAM
+# ─────────────────────────────────────────────
+def buat_slot(jam_mulai: str, jam_selesai: str, durasi: int) -> list[str]:
+    fmt   = "%H.%M"
+    start = datetime.strptime(jam_mulai, fmt)
+    end   = datetime.strptime(jam_selesai, fmt)
+    slots = []
+    while start + timedelta(minutes=durasi) <= end:
+        nxt = start + timedelta(minutes=durasi)
+        slots.append(f"{start.strftime('%H.%M')}-{nxt.strftime('%H.%M')}")
+        start = nxt
+    return slots
 
-        # Belum Terplot
-        ws_tim = wb.create_sheet("Tim Belum Terplot")
-        ws_tim.append(["NRP", "Nama Ketua", "Bidang PKM"])
-        terplot = {h["NRP"] for h in hasil}
-        for _, r in df_tim.iterrows():
-            if r["NRP"] not in terplot:
-                ws_tim.append([r["NRP"], r["Nama Ketua"], r["Bidang PKM"]])
 
-        ws_dosen = wb.create_sheet("Dosen Belum Terplot")
-        ws_dosen.append(["Nama Dosen", "Hari", "Sesi Jam", "Jam Tidak Terplot", "Lokasi"])
-        for d, data in slot_dosen.items():
-            for h, sesi_list in data["jadwal"].items():
-                for s in sesi_list:
-                    slot = [x["Jam"] for x in hasil if x["Dosen"] == d and x["Hari"] == h and x["Sesi"] == s["range"]]
-                    sisa = hitung_sisa_jam(s["range"], slot)
-                    if sisa:
-                        ws_dosen.append([d, h, s["range"], sisa, data["lokasi"]])
+def parse_sesi(jam_text: str, durasi: int) -> list[dict]:
+    if pd.isna(jam_text) or _is_kosong(str(jam_text)):
+        return []
+    sesi_list = []
+    for bagian in str(jam_text).split(","):
+        bagian = bagian.strip()
+        if " - " not in bagian:
+            continue
+        mulai, selesai = [x.strip() for x in bagian.split(" - ", 1)]
+        try:
+            slots = buat_slot(mulai, selesai, durasi)
+            if slots:
+                sesi_list.append({"range": f"{mulai} - {selesai}", "slots": slots})
+        except ValueError:
+            pass
+    return sesi_list
 
-        # Rekap
-        ws_rekap = wb.create_sheet("Rekap")
-        ws_rekap.append(["REKAP JADWAL BIMBINGAN KOMUNAL"])
-        ws_rekap.merge_cells(
-            start_row=1,
-            start_column=1,
-            end_row=1,
-            end_column=6
+
+def jam_mulai_dt(sesi_range: str) -> datetime:
+    return datetime.strptime(sesi_range.split(" - ")[0].strip(), "%H.%M")
+
+
+def hitung_sisa_jam(sesi_range: str, slot_terpakai: int, semua_slots: list[str]) -> str | None:
+    total = len(semua_slots)
+    if slot_terpakai >= total:
+        return None
+    _, selesai_range = sesi_range.split(" - ", 1)
+    if slot_terpakai == 0:
+        mulai_range = sesi_range.split(" - ")[0].strip()
+        return f"{mulai_range} - {selesai_range.strip()}"
+    last_slot_end = semua_slots[slot_terpakai - 1].split("-")[1]  # format HH.MM
+    return f"{last_slot_end} - {selesai_range.strip()}"
+
+
+# ─────────────────────────────────────────────
+#  BUILD SLOT DOSEN
+# ─────────────────────────────────────────────
+def build_slot_dosen(df_dosen: pd.DataFrame, kolom_hari: dict, durasi: int) -> dict:
+    """
+    Bangun struktur slot dosen.
+    resolve_kolom_hari dipanggil SATU KALI di luar loop baris.
+    """
+    resolved   = resolve_kolom_hari(list(df_dosen.columns), kolom_hari)
+    slot_dosen = {}
+
+    for _, row in df_dosen.iterrows():
+        nama         = row["nama lengkap"]
+        bidang_list  = [b.strip() for b in str(row["bidang pkm"]).split(",")]
+        lokasi_raw   = row.get("lokasi", "")
+        lokasi       = "" if (pd.isna(lokasi_raw) or str(lokasi_raw).strip().lower() in ("nan", "none", "")) else str(lokasi_raw).strip()
+
+        slot_dosen[nama] = {
+            "bidang":         [b.lower() for b in bidang_list],
+            "bidang_display": bidang_list,
+            "lokasi":         lokasi,
+            "jadwal":         {},
+        }
+
+        for nama_hari, kol in resolved.items():
+            if kol is None or kol not in row.index:
+                continue
+            sesi_list = parse_sesi(row[kol], durasi)
+            if sesi_list:
+                slot_dosen[nama]["jadwal"][nama_hari] = [
+                    {
+                        "range":       s["range"],
+                        "slots":       s["slots"],
+                        "slot_index":  0,
+                    }
+                    for s in sesi_list
+                ]
+    return slot_dosen
+
+
+def hitung_sisa_kapasitas(slot_dosen: dict, maks: int) -> dict[str, int]:
+    result = {}
+    for nama, data in slot_dosen.items():
+        total = 0
+        for sesi_list in data["jadwal"].values():
+            for sesi in sesi_list:
+                total += max(0, min(maks, len(sesi["slots"])) - sesi["slot_index"])
+        result[nama] = total
+    return result
+
+
+# ─────────────────────────────────────────────
+#  ALGORITMA PENJADWALAN
+# ─────────────────────────────────────────────
+def run_scheduling(
+    df_tim:       pd.DataFrame,
+    slot_dosen:   dict,
+    maks_per_sesi: int,
+    random_seed:  int,
+) -> list[dict]:
+    """
+    Greedy FIFO dengan load-balancing:
+    - Tim diproses urut (FIFO = prioritas pendaftar awal).
+    - Dosen diacak lalu diurutkan by sisa kapasitas (load balancing).
+    """
+    rng  = random.Random(random_seed)
+    hasil = []
+
+    for _, tim in df_tim.iterrows():
+        bidang_tim = str(tim["bidang pkm"]).strip().lower()
+        assigned   = False
+
+        kandidat = [
+            nama for nama, data in slot_dosen.items()
+            if bidang_tim in data["bidang"]
+        ]
+
+        rng.shuffle(kandidat)
+        sisa = hitung_sisa_kapasitas(slot_dosen, maks_per_sesi)
+        kandidat.sort(key=lambda n: sisa[n], reverse=True)
+
+        for nama_dosen in kandidat:
+            if assigned:
+                break
+            data = slot_dosen[nama_dosen]
+            for nama_hari, sesi_list in data["jadwal"].items():
+                if assigned:
+                    break
+                for sesi in sesi_list:
+                    if sesi["slot_index"] >= maks_per_sesi:
+                        continue
+                    if sesi["slot_index"] >= len(sesi["slots"]):
+                        continue
+                    jam = sesi["slots"][sesi["slot_index"]]
+                    sesi["slot_index"] += 1
+                    hasil.append(
+                        {
+                            "Dosen":  nama_dosen,
+                            "Hari":   nama_hari,
+                            "Sesi":   sesi["range"],
+                            "Jam":    jam,
+                            "Ketua":  tim["nama ketua"],
+                            "NRP":    tim["nrp"],
+                            "Bidang": tim["bidang pkm"],
+                            "Lokasi": data["lokasi"],
+                        }
+                    )
+                    assigned = True
+                    break
+
+    return hasil
+
+
+# ─────────────────────────────────────────────
+#  HELPER STYLE EXCEL
+# ─────────────────────────────────────────────
+def _make_border() -> Border:
+    thin = Side(style="thin")
+    return Border(left=thin, right=thin, top=thin, bottom=thin)
+
+
+def _make_fill(hex_color: str) -> PatternFill:
+    return PatternFill("solid", fgColor=hex_color)
+
+
+_BORDER  = None   # lazy-init per wb session
+_CENTER  = Alignment(horizontal="center", vertical="center", wrap_text=True)
+_LEFT    = Alignment(horizontal="left",   vertical="center", wrap_text=True)
+
+
+def _cell(ws, r: int, c: int, value=None, fill=None, font=None, align=None):
+    cell = ws.cell(row=r, column=c)
+    if value is not None:
+        cell.value = value
+    cell.border  = _make_border()
+    cell.alignment = align or _CENTER
+    if fill:
+        cell.fill = fill
+    if font:
+        cell.font = font
+    return cell
+
+
+def _merge(ws, r1: int, c1: int, r2: int, c2: int,
+           value=None, fill=None, font=None, align=None):
+    ws.merge_cells(start_row=r1, start_column=c1, end_row=r2, end_column=c2)
+    _cell(ws, r1, c1, value=value, fill=fill, font=font, align=align)
+
+
+def _auto_col_width(ws, max_width: int = 40):
+    from openpyxl.cell.cell import MergedCell
+    for col_cells in ws.columns:
+        # Skip kolom yang diawali MergedCell (tidak punya column_letter)
+        first = next((c for c in col_cells if not isinstance(c, MergedCell)), None)
+        if first is None:
+            continue
+        length = max(
+            (len(str(cell.value or "")) for cell in col_cells if not isinstance(cell, MergedCell)),
+            default=8,
         )
-        ws_rekap.cell(1,1).alignment = center
+        ws.column_dimensions[first.column_letter].width = min(length + 4, max_width)
+
+
+# ─────────────────────────────────────────────
+#  EXPORT EXCEL — sheet-level functions
+# ─────────────────────────────────────────────
+FILL_DOSEN  = _make_fill("3D85C6")
+FILL_HARI   = _make_fill("9FC5E8")
+FILL_LOKASI = _make_fill("FFF2CC")
+FILL_HEADER = _make_fill("D9D9D9")
+FILL_BELUM  = _make_fill("FCE5CD")
+
+FONT_WHITE_BOLD = Font(bold=True, color="FFFFFF")
+FONT_BOLD       = Font(bold=True)
+
+
+def _sheet_jadwal_hari(wb: Workbook, hari: str, daftar: list, maks_per_sesi: int,
+                       max_table_per_row: int):
+    TABLE_W = 6
+    HDR_H   = 4
+    TABLE_H = HDR_H + maks_per_sesi
+
+    ws = wb.create_sheet(hari)
+    ws.sheet_view.showGridLines = True
+
+    daftar_sorted = sorted(daftar, key=lambda x: jam_mulai_dt(x[0]))
+
+    for table_idx, (sesi, dosen, items) in enumerate(daftar_sorted):
+        sc = 1 + (table_idx % max_table_per_row) * TABLE_W
+        sr = 1 + (table_idx // max_table_per_row) * (TABLE_H + 2)
+
+        # Baris 1 – nama dosen
+        _merge(ws, sr, sc, sr, sc + 4,
+               value=dosen, fill=FILL_DOSEN, font=FONT_WHITE_BOLD)
+
+        # Baris 2 – hari + sesi
+        _merge(ws, sr + 1, sc, sr + 1, sc + 4,
+               value=f"{hari}, {sesi}", fill=FILL_HARI)
+
+        # Baris 3 – lokasi
+        lokasi_val = items[0]["Lokasi"] if items else ""
+        _merge(ws, sr + 2, sc, sr + 2, sc + 4,
+               value=lokasi_val if lokasi_val else "—", fill=FILL_LOKASI)
+
+        # Baris 4 – header kolom
+        for i, h in enumerate(["No", "NRP", "Jam", "Nama Ketua", "Bidang"]):
+            _cell(ws, sr + 3, sc + i, value=h, fill=FILL_HEADER, font=FONT_BOLD)
+
+        # Baris data
+        for i in range(maks_per_sesi):
+            r = sr + 4 + i
+            _cell(ws, r, sc, value=i + 1)
+            if i < len(items):
+                _cell(ws, r, sc + 1, value=items[i]["NRP"],    align=_LEFT)
+                _cell(ws, r, sc + 2, value=items[i]["Jam"])
+                _cell(ws, r, sc + 3, value=items[i]["Ketua"],  align=_LEFT)
+                _cell(ws, r, sc + 4, value=items[i]["Bidang"])
+            else:
+                for c in range(sc + 1, sc + 5):
+                    _cell(ws, r, c)
+
+    _auto_col_width(ws)
+
+
+def _sheet_tim_belum_terplot(wb: Workbook, df_tim: pd.DataFrame, terplot_nrp_bidang: set):
+    ws = wb.create_sheet("Tim Belum Terplot")
+    headers = ["No", "NRP", "Nama Ketua", "Bidang PKM"]
+    for i, h in enumerate(headers, 1):
+        _cell(ws, 1, i, value=h, fill=FILL_HEADER, font=FONT_BOLD)
+
+    row_idx = 2
+    nomor   = 1
+    for _, r in df_tim.iterrows():
+        key = (str(r["nrp"]), str(r["bidang pkm"]))
+        if key not in terplot_nrp_bidang:
+            _cell(ws, row_idx, 1, value=nomor)
+            _cell(ws, row_idx, 2, value=str(r["nrp"]),         align=_LEFT)
+            _cell(ws, row_idx, 3, value=str(r["nama ketua"]),  align=_LEFT)
+            _cell(ws, row_idx, 4, value=str(r["bidang pkm"]),  align=_LEFT)
+            row_idx += 1
+            nomor   += 1
+
+    _auto_col_width(ws)
+
+
+def _sheet_dosen_belum_terplot(wb: Workbook, slot_dosen: dict):
+    ws      = wb.create_sheet("Dosen Belum Terplot")
+    headers = ["No", "Nama Dosen", "Hari", "Sesi Jam", "Sisa Jam Kosong", "Lokasi"]
+    for i, h in enumerate(headers, 1):
+        _cell(ws, 1, i, value=h, fill=FILL_HEADER, font=FONT_BOLD)
+
+    row = 2
+    no  = 1
+    for nama_dosen, data in slot_dosen.items():
+        for nama_hari, sesi_list in data["jadwal"].items():
+            for sesi in sesi_list:
+                sisa_str = hitung_sisa_jam(sesi["range"], sesi["slot_index"], sesi["slots"])
+                if sisa_str:
+                    vals = [no, nama_dosen, nama_hari, sesi["range"],
+                            sisa_str, data["lokasi"] or "—"]
+                    for i, v in enumerate(vals, 1):
+                        _cell(ws, row, i, value=v, align=_LEFT)
+                    row += 1
+                    no  += 1
+
+    _auto_col_width(ws)
+
+
+def _sheet_rekap(wb: Workbook, df_hasil: pd.DataFrame):
+    ws = wb.create_sheet("Rekap")
+    if df_hasil.empty:
+        ws.cell(1, 1, "Tidak ada data hasil penjadwalan.")
+        return
+
+    def tulis_block(start_row: int, judul: str, rows: list[list]) -> int:
+        ws.cell(row=start_row, column=1, value=judul).font = FONT_BOLD
+        r = start_row + 1
+        for data_row in rows:
+            is_header = (r == start_row + 1)
+            fill = FILL_HEADER if is_header else None
+            for c_idx, val in enumerate(data_row, 1):
+                _cell(ws, r, c_idx, value=val,
+                      fill=fill,
+                      font=FONT_BOLD if is_header else None,
+                      align=_LEFT)
+            r += 1
+        return r + 1  # baris kosong pemisah
+
+    r = 1
+
+    # 1. Tim per hari per bidang
+    pivot = pd.pivot_table(
+        df_hasil, index="Hari", columns="Bidang",
+        values="Ketua", aggfunc="count", fill_value=0,
+    )
+    header = ["Hari"] + list(pivot.columns)
+    rows   = [header] + [[h] + list(v) for h, v in pivot.iterrows()]
+    r = tulis_block(r, "Jumlah Tim per Hari per Bidang PKM", rows)
+
+    # 2. Tim per hari
+    rows = [["Hari", "Jumlah Tim"]] + [
+        [h, int(c)] for h, c in df_hasil.groupby("Hari")["Ketua"].count().items()
+    ]
+    r = tulis_block(r, "Jumlah Tim per Hari", rows)
+
+    # 3. Dosen per hari
+    rows = [["Hari", "Jumlah Dosen"]] + [
+        [h, int(c)] for h, c in df_hasil.groupby("Hari")["Dosen"].nunique().items()
+    ]
+    r = tulis_block(r, "Jumlah Dosen per Hari", rows)
+
+    # 4. Tim per dosen
+    rows = [["Nama Dosen", "Jumlah Tim"]] + [
+        [d, int(c)] for d, c in df_hasil.groupby("Dosen")["Ketua"].count().items()
+    ]
+    tulis_block(r, "Jumlah Tim per Dosen", rows)
+
+    _auto_col_width(ws, max_width=50)
+
+
+# ─────────────────────────────────────────────
+#  EXPORT EXCEL — orkestrator
+# ─────────────────────────────────────────────
+def export_excel(
+    hasil:           list[dict],
+    slot_dosen:      dict,
+    df_tim:          pd.DataFrame,
+    maks_per_sesi:   int,
+    max_table_per_row: int,
+) -> bytes:
+    wb = Workbook()
+    del wb["Sheet"]
+
+    # Kelompokkan hasil: hari → dosen → sesi → [item]
+    grouped: dict = {}
+    for h in hasil:
+        (grouped
+         .setdefault(h["Hari"], {})
+         .setdefault(h["Dosen"], {})
+         .setdefault(h["Sesi"], [])
+         .append(h))
+
+    # Sheet per hari
+    for hari in sorted(grouped):
+        daftar = [
+            (sesi, dosen, items)
+            for dosen, sd in grouped[hari].items()
+            for sesi, items in sd.items()
+        ]
+        _sheet_jadwal_hari(wb, hari, daftar, maks_per_sesi, max_table_per_row)
+
+    # Sheet tim belum terplot
+    terplot_set = {(h["NRP"], h["Bidang"]) for h in hasil}
+    _sheet_tim_belum_terplot(wb, df_tim, terplot_set)
+
+    # Sheet dosen belum terplot
+    _sheet_dosen_belum_terplot(wb, slot_dosen)
+
+    # Sheet rekap
+    _sheet_rekap(wb, pd.DataFrame(hasil) if hasil else pd.DataFrame())
+
+    buf = io.BytesIO()
+    wb.save(buf)
+    buf.seek(0)
+    return buf.getvalue()
+
+
+# ─────────────────────────────────────────────
+#  KOMPONEN UI
+# ─────────────────────────────────────────────
+def render_panduan():
+    with st.expander("📋 Panduan Format File Excel", expanded=False):
+        st.markdown(
+            """
+Unggah dua file Excel dengan format di bawah ini.
+Nama kolom **tidak case-sensitive** (huruf besar/kecil tidak berpengaruh).
+            """
+        )
+        tab1, tab2 = st.tabs(["📁 File Tim", "📁 File Dosen"])
+
+        with tab1:
+            st.markdown("**Kolom wajib:**")
+            st.markdown(
+                "- `NRP`: Nomor Registrasi Pokok mahasiswa ketua tim  \n"
+                "- `Nama Ketua`: Nama lengkap ketua tim  \n"
+                "- `Bidang PKM`: Bidang PKM tim (harus sama persis dengan yang ada di file dosen)"
+            )
+            st.markdown(
+                "**Catatan duplikasi NRP:**  \n"
+                "Jika satu NRP muncul lebih dari sekali dengan **Bidang PKM berbeda**, "
+                "keduanya akan dijadwalkan masing-masing.  \n"
+                "Jika NRP dan Bidang PKM **sama persis**, baris duplikat akan dihapus otomatis (keep first)."
+            )
+            st.markdown("**Contoh data:**")
+            st.dataframe(CONTOH_TIM, hide_index=True, use_container_width=True)
+
+        with tab2:
+            st.markdown("**Kolom wajib:**")
+            st.markdown(
+                "- `Nama Lengkap`: Nama dosen  \n"
+                "- `Bidang PKM`: Bidang yang bisa dibimbing, pisah koma jika lebih dari satu  \n"
+                "- `Lokasi`: Ruang/lokasi *(opsional, isi `—` jika belum ditentukan)*  \n"
+                "- **Kolom hari** Sesuai yang diisi di sidebar. "
+                "Cukup tuliskan sebagian nama kolom, misalnya `Senin` sudah cukup untuk "
+                "mencocokkan `Jam Kesediaan pada Senin, 12 Januari 2026`."
+            )
+            st.markdown(
+                "**Format jam:** `HH.MM - HH.MM`  \n"
+                "Lebih dari satu sesi per hari pisahkan dengan koma: `08.00 - 10.00, 13.00 - 15.00`  \n"
+                "Jika tidak bersedia, isi `Tidak Bersedia` atau kosongkan."
+            )
+            st.markdown("**Contoh data:**")
+            st.dataframe(CONTOH_DOSEN, hide_index=True, use_container_width=True)
+
+
+def render_preview_kapasitas(df_tim: pd.DataFrame, slot_dosen: dict, maks_per_sesi: int):
+    with st.expander("🔍 Preview Kapasitas Sebelum Proses", expanded=True):
+        total_tim = len(df_tim)
+        total_kapasitas = sum(
+            min(maks_per_sesi, len(s["slots"]))
+            for data in slot_dosen.values()
+            for sesi_list in data["jadwal"].values()
+            for s in sesi_list
+        )
+
+        col1, col2, col3 = st.columns(3)
+        col1.metric("Jumlah Tim", total_tim)
+        col2.metric("Total Kapasitas Slot", total_kapasitas)
+        delta = total_kapasitas - total_tim
+        col3.metric(
+            "Selisih",
+            delta,
+            delta=f"{'+' if delta >= 0 else ''}{delta}",
+            delta_color="normal" if delta >= 0 else "inverse",
+        )
+
+        if delta < 0:
+            st.warning(
+                f"⚠️ Kapasitas dosen ({total_kapasitas}) lebih sedikit dari jumlah tim ({total_tim}). "
+                f"Diprediksi **{abs(delta)} tim tidak akan terplot**."
+            )
+        else:
+            st.success(f"✅ Kapasitas cukup. Ada {delta} slot tersisa setelah semua tim terplot.")
+
+        st.markdown("**Kapasitas per Bidang PKM:**")
+        bidang_tim = df_tim["bidang pkm"].value_counts().reset_index()
+        bidang_tim.columns = ["Bidang PKM", "Jumlah Tim"]
+
+        kapasitas_bidang: dict[str, int] = {}
+        for data in slot_dosen.values():
+            for bidang in data["bidang_display"]:
+                for sesi_list in data["jadwal"].values():
+                    for s in sesi_list:
+                        kapasitas_bidang[bidang] = (
+                            kapasitas_bidang.get(bidang, 0) + min(maks_per_sesi, len(s["slots"]))
+                        )
+
+        bidang_tim["Kapasitas Dosen"] = bidang_tim["Bidang PKM"].map(
+            lambda b: kapasitas_bidang.get(b, 0)
+        )
+        bidang_tim["Status"] = bidang_tim.apply(
+            lambda r: "✅ Cukup" if r["Kapasitas Dosen"] >= r["Jumlah Tim"] else "⚠️ Kurang",
+            axis=1,
+        )
+        st.dataframe(bidang_tim, hide_index=True, use_container_width=True)
+
+
+# ─────────────────────────────────────────────
+#  MAIN APP
+# ─────────────────────────────────────────────
+def main():
+    st.set_page_config(
+        page_title="Penjadwalan Bimbingan Komunal",
+        page_icon="📅",
+        layout="wide",
+    )
+    st.title("📅 Sistem Penjadwalan Bimbingan Komunal")
+    st.caption("Penjadwalan otomatis berbasis ketersediaan dosen dan bidang PKM.")
+
+    # ── Sidebar ──
+    st.sidebar.header("⚙️ Parameter Penjadwalan")
+
+    DURASI          = st.sidebar.number_input("Durasi per Tim (menit)",             10, 120, 20)
+    MAKS_PER_SESI   = st.sidebar.number_input("Maks Tim per Dosen per Sesi",          1,  30, 12)
+    MAX_TABLE_ROW   = st.sidebar.number_input("Jumlah Tabel per Baris (Excel)",        1,  10,  6)
+    OUTPUT_FILE     = st.sidebar.text_input("Nama File Output", value="jadwal_bikom.xlsx")
+    RANDOM_SEED     = st.sidebar.number_input(
+        "Random Seed",
+        min_value=0, max_value=9999, value=42,
+        help="Angka yang sama → urutan dosen yang sama. Ubah jika ingin variasi.",
+    )
+
+    st.sidebar.markdown("---")
+    st.sidebar.markdown("### 🗓️ Hari Bimbingan")
+
+    JUMLAH_HARI = st.sidebar.number_input("Jumlah Hari", 1, 14, 5)
+    HARI_BIMBINGAN: dict[str, str] = {}
+
+    for i in range(JUMLAH_HARI):
+        c1, c2 = st.sidebar.columns(2)
+        nama_hari = c1.text_input(f"Nama Hari {i+1}", key=f"hari_{i}", placeholder="Senin")
+        nama_kol  = c2.text_input(f"Kolom Excel {i+1}", key=f"kol_{i}", placeholder="Senin")
+        if nama_hari.strip() and nama_kol.strip():
+            HARI_BIMBINGAN[nama_hari.strip()] = nama_kol.strip()
+
+    # ── Panduan ──
+    render_panduan()
+    st.divider()
+
+    # ── Upload ──
+    st.subheader("📂 Upload File Data")
+    col_up1, col_up2 = st.columns(2)
+    with col_up1:
+        file_tim   = st.file_uploader("File Data Tim (.xlsx)",   type=["xlsx"])
+    with col_up2:
+        file_dosen = st.file_uploader("File Data Dosen (.xlsx)", type=["xlsx"])
+
+    if not (file_tim and file_dosen):
+        st.info("Unggah kedua file untuk melanjutkan.")
+        return
+
+    # ── Baca & bersihkan ──
+    try:
+        df_tim_raw   = pd.read_excel(file_tim)
+        df_dosen_raw = pd.read_excel(file_dosen)
+    except Exception as e:
+        st.error(f"Gagal membaca file Excel: {e}")
+        return
+
+    df_tim   = clean_dataframe(normalize_columns(df_tim_raw.copy()))
+    df_dosen = clean_dataframe(normalize_columns(df_dosen_raw.copy()))
+
+    # ── Validasi kolom ──
+    errors: list[str] = []
+    errors += validasi_kolom(df_tim,   KOLOM_WAJIB_TIM,   "Tim")
+    errors += validasi_kolom(df_dosen, KOLOM_WAJIB_DOSEN, "Dosen")
+
+    if errors:
+        st.error("**Struktur file tidak sesuai. Perbaiki terlebih dahulu:**")
+        for e in errors:
+            st.markdown(f"- {e}")
+        return
+
+    # ── De-duplikasi tim (NRP + Bidang PKM sama persis) ──
+    df_tim, n_dup = deduplikasi_tim(df_tim)
+    if n_dup > 0:
+        st.info(
+            f"ℹ️ Ditemukan **{n_dup} baris duplikat** (NRP + Bidang PKM sama persis) dan telah dihapus. "
+            "Tim dengan NRP sama tapi Bidang PKM berbeda tetap dijadwalkan masing-masing."
+        )
+
+    # ── Validasi hari ──
+    if not HARI_BIMBINGAN:
+        st.warning("Belum ada hari bimbingan yang dikonfigurasi di sidebar.")
+        return
+
+    kolom_hari_lower = {h: k.strip() for h, k in HARI_BIMBINGAN.items()}
+
+    # ── Validasi isi ──
+    warnings_isi: list[str] = []
+    warnings_isi += validasi_isi_tim(df_tim)
+    warnings_isi += validasi_isi_dosen(df_dosen, kolom_hari_lower)
+    warnings_isi += cek_bidang_mismatch(df_tim, df_dosen)
+
+    if warnings_isi:
+        with st.expander("⚠️ Peringatan Data (klik untuk lihat)", expanded=True):
+            for w in warnings_isi:
+                st.warning(w)
+            st.markdown(
+                "_Anda tetap bisa memproses, namun tim/dosen yang bermasalah mungkin tidak terplot._"
+            )
+
+    # ── Preview data ──
+    st.subheader("👁️ Preview Data")
+    with st.expander("Lihat data yang terbaca", expanded=False):
+        t1, t2 = st.tabs(["Data Tim", "Data Dosen"])
+        with t1:
+            st.dataframe(df_tim,   hide_index=True, use_container_width=True)
+        with t2:
+            st.dataframe(df_dosen, hide_index=True, use_container_width=True)
+
+    # ── Build slot & preview kapasitas ──
+    slot_dosen = build_slot_dosen(df_dosen, kolom_hari_lower, DURASI)
+    render_preview_kapasitas(df_tim, slot_dosen, MAKS_PER_SESI)
+
+    st.divider()
+
+    # ── Proses ──
+    if st.button("🚀 Proses Penjadwalan", type="primary", use_container_width=True):
+        with st.spinner("Memproses penjadwalan..."):
+            slot_dosen_fresh = build_slot_dosen(df_dosen, kolom_hari_lower, DURASI)
+            hasil = run_scheduling(df_tim, slot_dosen_fresh, MAKS_PER_SESI, RANDOM_SEED)
+
+        if not hasil:
+            st.error("Tidak ada tim yang berhasil dijadwalkan. Periksa kesesuaian data.")
+            return
 
         df_hasil = pd.DataFrame(hasil)
 
-        ws_rekap.append([])
-        ws_rekap.append(["Jumlah Tim per Hari per Bidang PKM"])
-        pivot = pd.pivot_table(df_hasil, index="Hari", columns="Bidang", values="Ketua", aggfunc="count", fill_value=0)
-        ws_rekap.append(["Hari"] + list(pivot.columns))
-        for h, v in pivot.iterrows():
-            ws_rekap.append([h] + list(v))
+        # ── Ringkasan ──
+        st.subheader("📊 Ringkasan Hasil")
+        total_tim     = len(df_tim)
+        total_terplot = len(df_hasil)
+        total_tidak   = total_tim - total_terplot
 
-        ws_rekap.append([])
-        ws_rekap.append(["Jumlah Tim per Hari"])
-        ws_rekap.append(["Hari", "Jumlah Tim"])
-        for h, c in df_hasil.groupby("Hari")["Ketua"].count().items():
-            ws_rekap.append([h, c])
+        m1, m2, m3 = st.columns(3)
+        m1.metric("Total Tim", total_tim)
+        m2.metric("Berhasil Terplot", total_terplot)
+        m3.metric(
+            "Tidak Terplot",
+            total_tidak,
+            delta=f"-{total_tidak}" if total_tidak > 0 else "0",
+            delta_color="inverse" if total_tidak > 0 else "off",
+        )
 
-        ws_rekap.append([])
-        ws_rekap.append(["Jumlah Dosen per Hari"])
-        ws_rekap.append(["Hari", "Jumlah Dosen"])
-        for h, c in df_hasil.groupby("Hari")["Dosen"].nunique().items():
-            ws_rekap.append([h, c])
+        with st.expander("Rekap per Hari & Bidang", expanded=False):
+            pivot = pd.pivot_table(
+                df_hasil, index="Hari", columns="Bidang",
+                values="Ketua", aggfunc="count", fill_value=0,
+            )
+            st.dataframe(pivot, use_container_width=True)
 
-        ws_rekap.append([])
-        ws_rekap.append(["Jumlah Tim per Dosen"])
-        ws_rekap.append(["Nama Dosen", "Jumlah Tim"])
-        for d, c in df_hasil.groupby("Dosen")["Ketua"].count().items():
-            ws_rekap.append([d, c])
+        # ── Download ──
+        st.divider()
+        try:
+            excel_bytes = export_excel(
+                hasil, slot_dosen_fresh, df_tim, MAKS_PER_SESI, MAX_TABLE_ROW
+            )
+            st.download_button(
+                label="⬇️ Download Jadwal Excel",
+                data=excel_bytes,
+                file_name=OUTPUT_FILE,
+                mime="application/vnd.openxmlformats-officedocument.spreadsheetml.sheet",
+                type="primary",
+                use_container_width=True,
+            )
+            st.success(
+                f"✅ Penjadwalan selesai. **{total_terplot}** dari **{total_tim}** tim berhasil dijadwalkan."
+            )
+        except Exception as e:
+            st.error(f"Gagal membuat file Excel: {e}")
+            st.exception(e)
 
-        buffer = io.BytesIO()
-        wb.save(buffer)
-        buffer.seek(0)
 
-        st.download_button("⬇️ Download Jadwal Excel", buffer, OUTPUT_FILE)
-        st.success("Penjadwalan selesai")
+if __name__ == "__main__":
+    main()
