@@ -163,7 +163,7 @@ def buat_slot(jam_mulai: str, jam_selesai: str, durasi: int) -> list[str]:
     slots = []
     while start + timedelta(minutes=durasi) <= end:
         nxt = start + timedelta(minutes=durasi)
-        slots.append(f"{start.strftime('%H.%M')}-{nxt.strftime('%H.%M')}")
+        slots.append(f"{start.strftime('%H:%M')}-{nxt.strftime('%H:%M')}")
         start = nxt
     return slots
 
@@ -258,21 +258,101 @@ def hitung_sisa_kapasitas(slot_dosen: dict, maks: int) -> dict[str, int]:
 # ─────────────────────────────────────────────
 #  ALGORITMA PENJADWALAN
 # ─────────────────────────────────────────────
+def hitung_pilihan_dosen_per_bidang(slot_dosen: dict) -> dict[str, int]:
+    """
+    Hitung berapa banyak dosen yang tersedia untuk setiap bidang PKM.
+    Digunakan untuk sorting least-options-first.
+    """
+    bidang_count: dict[str, int] = {}
+    for data in slot_dosen.values():
+        for b in data["bidang"]:
+            bidang_count[b] = bidang_count.get(b, 0) + 1
+    return bidang_count
+
+
 def run_scheduling(
-    df_tim:       pd.DataFrame,
-    slot_dosen:   dict,
+    df_tim:        pd.DataFrame,
+    slot_dosen:    dict,
     maks_per_sesi: int,
-    random_seed:  int,
+    random_seed:   int,
 ) -> list[dict]:
     """
-    Greedy FIFO dengan load-balancing:
-    - Tim diproses urut (FIFO = prioritas pendaftar awal).
-    - Dosen diacak lalu diurutkan by sisa kapasitas (load balancing).
-    """
-    rng  = random.Random(random_seed)
-    hasil = []
+    Greedy dengan dua level optimasi:
 
-    for _, tim in df_tim.iterrows():
+    1. Least-options-first (LOF): bidang yang punya sedikit dosen diproses lebih dulu
+       agar tidak kalah berebut slot dengan bidang yang punya banyak dosen.
+    2. Dalam satu bidang, urutan FIFO (urutan baris di file) tetap dipertahankan
+       sehingga pendaftar pertama tetap prioritas mendapat slot.
+    3. Pemilihan dosen: acak + sort by sisa kapasitas (load balancing).
+    """
+    rng = random.Random(random_seed)
+
+    # Hitung jumlah dosen per bidang — tetap dihitung sekali di awal
+    pilihan_per_bidang = hitung_pilihan_dosen_per_bidang(slot_dosen)
+
+    # Kelompokkan tim per bidang, pertahankan urutan asli (FIFO) dalam tiap bidang
+    # dengan menyimpan index baris asli sebagai tiebreaker
+    from collections import defaultdict
+    tim_per_bidang: dict[str, list[tuple[int, object]]] = defaultdict(list)
+    for idx, (_, tim) in enumerate(df_tim.iterrows()):
+        bidang = str(tim["bidang pkm"]).strip().lower()
+        tim_per_bidang[bidang].append((idx, tim))
+
+    # Tentukan dosen eksklusif vs dosen multi-bidang
+    # Dosen eksklusif: hanya melayani 1 bidang — bidangnya tidak bersaing
+    # Dosen multi-bidang: melayani >1 bidang — menjadi rebutan
+    dosen_per_bidang: dict[str, list[str]] = {}
+    for nama_dosen, data in slot_dosen.items():
+        for b in data["bidang"]:
+            dosen_per_bidang.setdefault(b, []).append(nama_dosen)
+
+    def punya_dosen_eksklusif(bidang: str) -> bool:
+        """True jika bidang ini punya setidaknya satu dosen yang HANYA melayani bidang ini."""
+        for nama_dosen in dosen_per_bidang.get(bidang, []):
+            if len(slot_dosen[nama_dosen]["bidang"]) == 1:
+                return True
+        return False
+
+    # Pisah bidang menjadi 3 grup berdasarkan tingkat kekritisan:
+    # Grup 1 (paling kritis): hanya punya 1-2 dosen AND tidak punya dosen eksklusif
+    #         → rebutan penuh, harus diproses paling awal
+    # Grup 2: punya dosen eksklusif → aman, tapi tetap sebelum bidang besar
+    # Grup 3: punya banyak dosen (>=3) → diproses FIFO normal
+    THRESHOLD_LANGKA = 3
+
+    def grup_bidang(bidang: str) -> int:
+        n = pilihan_per_bidang.get(bidang, 0)
+        if n < THRESHOLD_LANGKA and not punya_dosen_eksklusif(bidang):
+            return 0   # kritis, rebutan
+        if punya_dosen_eksklusif(bidang):
+            return 1   # aman eksklusif
+        return 2       # banyak pilihan
+
+    urutan_bidang = sorted(
+        tim_per_bidang.keys(),
+        key=lambda b: (grup_bidang(b), pilihan_per_bidang.get(b, 0), len(tim_per_bidang[b]))
+    )
+
+    # Susun antrian:
+    # - Grup 0 (kritis) diproses penuh terlebih dahulu
+    # - Grup 1 dan 2 diproses FIFO berdasarkan index baris asli
+    antrian_kritis: list[tuple[int, object]] = []
+    antrian_normal: list[tuple[int, object]] = []
+
+    for bidang in urutan_bidang:
+        if grup_bidang(bidang) == 0:
+            antrian_kritis.extend(tim_per_bidang[bidang])
+        else:
+            antrian_normal.extend(tim_per_bidang[bidang])
+
+    # Antrian normal diurutkan kembali by index asli (FIFO global untuk non-kritis)
+    antrian_normal.sort(key=lambda x: x[0])
+
+    antrian: list[tuple[int, object]] = antrian_kritis + antrian_normal
+
+    # Proses antrian
+    hasil: list[dict] = []
+    for _idx, tim in antrian:
         bidang_tim = str(tim["bidang pkm"]).strip().lower()
         assigned   = False
 
@@ -280,7 +360,6 @@ def run_scheduling(
             nama for nama, data in slot_dosen.items()
             if bidang_tim in data["bidang"]
         ]
-
         rng.shuffle(kandidat)
         sisa = hitung_sisa_kapasitas(slot_dosen, maks_per_sesi)
         kandidat.sort(key=lambda n: sisa[n], reverse=True)
@@ -417,9 +496,10 @@ def _sheet_jadwal_hari(wb: Workbook, hari: str, daftar: list, maks_per_sesi: int
         _merge(ws, sr, sc, sr, sc + 3,
                value=dosen, fill=FILL_DOSEN, font=FONT_WHITE_BOLD)
 
-        # Baris 2 — hari + sesi
+        # Baris 2 — hari + sesi (format: Rabu, 09:00 - 13:00)
+        sesi_display = sesi.replace(".", ":")
         _merge(ws, sr + 1, sc, sr + 1, sc + 3,
-               value=f"{hari}  |  {sesi}", fill=FILL_HARI)
+               value=f"{hari}, {sesi_display}", fill=FILL_HARI)
 
         # Baris 3 — lokasi (kosong jika tidak ada, tanpa em dash)
         lokasi_val = (items[0]["Lokasi"] if items else "") or ""
@@ -443,6 +523,11 @@ def _sheet_jadwal_hari(wb: Workbook, hari: str, daftar: list, maks_per_sesi: int
                     _cell(ws, r, c)
 
     _auto_col_width(ws)
+    # Kolom "No" setiap tabel — paksa sempit
+    from openpyxl.utils import get_column_letter
+    for table_idx in range(len(daftar_sorted)):
+        no_col = 1 + (table_idx % max_table_per_row) * TABLE_W
+        ws.column_dimensions[get_column_letter(no_col)].width = 5
 
 
 def _sheet_tim_belum_terplot(wb: Workbook, df_tim: pd.DataFrame, terplot_nrp_bidang: set):
@@ -594,8 +679,30 @@ def export_excel(
 # ─────────────────────────────────────────────
 #  KOMPONEN UI
 # ─────────────────────────────────────────────
+def _icon(name: str, size: int = 16, color: str = "currentColor") -> str:
+    """
+    Render satu Lucide icon sebagai HTML inline menggunakan unpkg CDN.
+    Dipakai bersama st.markdown(..., unsafe_allow_html=True).
+    """
+    return (
+        f'<img src="https://unpkg.com/lucide-static@latest/icons/{name}.svg" '
+        f'width="{size}" height="{size}" '
+        f'style="vertical-align:-3px;margin-right:6px;'
+        f'filter:invert(0);opacity:0.85;" />'
+    )
+
+
+def _header_with_icon(icon_name: str, text: str, tag: str = "h3") -> None:
+    """Tampilkan subheader/header dengan Lucide icon di depannya."""
+    st.markdown(
+        f'<{tag} style="display:flex;align-items:center;gap:6px;margin-bottom:0">'
+        f'{_icon(icon_name, 20)}<span>{text}</span></{tag}>',
+        unsafe_allow_html=True,
+    )
+
+
 def render_panduan():
-    with st.expander("Panduan Format File Excel", expanded=False):
+    with st.expander(":clipboard: Panduan Format File Excel", expanded=False):
         st.markdown(
             """
 Unggah dua file Excel dengan format di bawah ini.
@@ -640,7 +747,7 @@ Nama kolom **tidak case-sensitive** (huruf besar/kecil tidak berpengaruh).
 
 
 def render_preview_kapasitas(df_tim: pd.DataFrame, slot_dosen: dict, maks_per_sesi: int):
-    with st.expander("Preview Kapasitas Sebelum Proses", expanded=True):
+    with st.expander(":bar_chart: Preview Kapasitas Sebelum Proses", expanded=True):
         total_tim = len(df_tim)
         total_kapasitas = sum(
             min(maks_per_sesi, len(s["slots"]))
@@ -700,11 +807,24 @@ def main():
         page_icon=":calendar:",
         layout="wide",
     )
-    st.title("Sistem Penjadwalan Bimbingan Komunal")
+
+    # Inject Lucide CDN sekali di awal
+    st.html(
+        '<script src="https://unpkg.com/lucide@latest"></script>'
+        '<script>document.addEventListener("DOMContentLoaded",()=>lucide.createIcons())</script>'
+    )
+
+    st.markdown(
+        f'{_icon("calendar-days", 28)} **Sistem Penjadwalan Bimbingan Komunal**',
+        unsafe_allow_html=True,
+    )
     st.caption("Penjadwalan otomatis berbasis ketersediaan dosen dan bidang PKM.")
 
     # ── Sidebar ──
-    st.sidebar.header("Parameter Penjadwalan")
+    st.sidebar.markdown(
+        f'### {_icon("settings",16)} Parameter Penjadwalan',
+        unsafe_allow_html=True,
+    )
 
     DURASI          = st.sidebar.number_input("Durasi per Tim (menit)",             10, 120, 20)
     MAKS_PER_SESI   = st.sidebar.number_input("Maks Tim per Dosen per Sesi",          1,  30, 12)
@@ -717,7 +837,10 @@ def main():
     )
 
     st.sidebar.markdown("---")
-    st.sidebar.markdown("### Hari Bimbingan")
+    st.sidebar.markdown(
+        f'### {_icon("calendar",16)} Hari Bimbingan',
+        unsafe_allow_html=True,
+    )
 
     JUMLAH_HARI = st.sidebar.number_input("Jumlah Hari", 1, 14, 5)
     HARI_BIMBINGAN: dict[str, str] = {}
@@ -734,7 +857,7 @@ def main():
     st.divider()
 
     # ── Upload ──
-    st.subheader("Upload File Data")
+    _header_with_icon("upload-cloud", "Upload File Data")
     col_up1, col_up2 = st.columns(2)
     with col_up1:
         file_tim   = st.file_uploader("File Data Tim (.xlsx)",   type=["xlsx"])
@@ -789,7 +912,7 @@ def main():
     warnings_isi += cek_bidang_mismatch(df_tim, df_dosen)
 
     if warnings_isi:
-        with st.expander("Peringatan Data (klik untuk lihat)", expanded=True):
+        with st.expander(":warning: Peringatan Data (klik untuk lihat)", expanded=True):
             for w in warnings_isi:
                 st.warning(w)
             st.markdown(
@@ -797,7 +920,7 @@ def main():
             )
 
     # ── Preview data ──
-    st.subheader("Preview Data")
+    _header_with_icon("table", "Preview Data")
     with st.expander("Lihat data yang terbaca", expanded=False):
         t1, t2 = st.tabs(["Data Tim", "Data Dosen"])
         with t1:
@@ -812,7 +935,7 @@ def main():
     st.divider()
 
     # ── Proses ──
-    if st.button("Proses Penjadwalan", type="primary", use_container_width=True):
+    if st.button(":rocket: Proses Penjadwalan", type="primary", use_container_width=True):
         with st.spinner("Memproses penjadwalan..."):
             slot_dosen_fresh = build_slot_dosen(df_dosen, kolom_hari_lower, DURASI)
             hasil = run_scheduling(df_tim, slot_dosen_fresh, MAKS_PER_SESI, RANDOM_SEED)
@@ -824,7 +947,7 @@ def main():
         df_hasil = pd.DataFrame(hasil)
 
         # ── Ringkasan ──
-        st.subheader("Ringkasan Hasil")
+        _header_with_icon("chart-bar", "Ringkasan Hasil")
         total_tim     = len(df_tim)
         total_terplot = len(df_hasil)
         total_tidak   = total_tim - total_terplot
@@ -839,7 +962,7 @@ def main():
             delta_color="inverse" if total_tidak > 0 else "off",
         )
 
-        with st.expander("Rekap per Hari & Bidang", expanded=False):
+        with st.expander(":clipboard: Rekap per Hari & Bidang", expanded=False):
             pivot = pd.pivot_table(
                 df_hasil, index="Hari", columns="Bidang",
                 values="Ketua", aggfunc="count", fill_value=0,
@@ -853,7 +976,7 @@ def main():
                 hasil, slot_dosen_fresh, df_tim, MAKS_PER_SESI, MAX_TABLE_ROW
             )
             st.download_button(
-                label="Download Jadwal Excel",
+                label=":arrow_down: Download Jadwal Excel",
                 data=excel_bytes,
                 file_name=OUTPUT_FILE,
                 mime="application/vnd.openxmlformats-officedocument.spreadsheetml.sheet",
